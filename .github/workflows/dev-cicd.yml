@@ -18,13 +18,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # 📂 빌드용 application.yml 생성 (테스트가 있다면 필요)
+      # 📂 빌드 전에 환경변수를 로드하도록 설정
       - name: Create application.yml for build
         run: |
           mkdir -p ./src/main/resources
           echo "${{ secrets.DEVELOPMENT_APPLICATION }}" > ./src/main/resources/application.yml
 
-      # Gradle 캐시
+      # Gradle 캐시 설정 (Gradle Wrapper 포함)
       - name: Cache Gradle packages
         uses: actions/cache@v3
         with:
@@ -41,81 +41,59 @@ jobs:
       # Docker 빌드 및 Docker Hub에 푸시
       - name: Docker build & push to Docker Hub
         run: |
-          echo "${{ secrets.DOKCER_PASSWORD }}" | docker login -u "${{ secrets.DOKCER_USERNAME }}" --password-stdin
-          docker build -t ${{ secrets.DOKCER_USERNAME }}/cubeai-dev:${{ github.sha }} .
-          docker push ${{ secrets.DOKCER_USERNAME }}/cubeai-dev:${{ github.sha }}
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/cubeai-dev:${{ github.sha }} .
+          docker push ${{ secrets.DOCKER_USERNAME }}/cubeai-dev:${{ github.sha }}
           docker logout
 
-  # -----------------------------------------------------------------
-  # 🚀 배포(Deploy) Job
-  # -----------------------------------------------------------------
-  deploy:
-    # build job이 성공해야만 실행
-    needs: build
-    runs-on: ubuntu-latest
-    
-    steps:
       # 서버에 배포
       - name: Docker image pull & deploy to server
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.DEV_SERVER_HOST }}
-          username: ubuntu 
+          username: ubuntu
           key: ${{ secrets.DEV_SERVER_PRIVATE_KEY }}
           script: |
             set -e  # 에러 발생 시 즉시 스크립트 종료
             
             # 네트워크가 존재하는지 확인하고, 없으면 생성
             if [ -z "$(sudo docker network ls | grep cubeai-network)" ]; then
-              echo "네트워크 'cubeai-network' 생성"
               sudo docker network create cubeai-network
             fi
             
-            # Redis 컨테이너 배포: 네트워크에 연결
+            # Redis 컨테이너 배포: 네트워크에 연결, 포트 매핑 (내부 통신용)
             echo "🚀 Redis 컨테이너 배포 중..."
             if [ "$(sudo docker inspect --format='{{.State.Running}}' cubeai-redis 2>/dev/null)" != "true" ]; then
-              echo "Redis 컨테이너가 없으므로 새로 시작합니다."
               sudo docker pull redis:alpine
-              sudo docker run -d \
-                --name cubeai-redis \
-                --network cubeai-network \
-                -p 6379:6379 \
-                redis:alpine \
-                redis-server --requirepass "${{ secrets.REDIS_PASSWORD }}" 
-                
-            else
-              echo "Redis가 이미 실행 중입니다."
+              sudo docker run -d --name redis --network cubeai-network -p 6380:6379 redis:alpine
             fi
             
             echo "🚀 최신 Docker 이미지 Pull 중..."
-            sudo docker pull ${{ secrets.DOKCER_USERNAME }}/cubeai-dev:${{ github.sha }}
+            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/cubeai-dev:${{ github.sha }}
             
-            echo "🛑 기존 앱 컨테이너 중지 및 삭제"
-            # 'docker inspect'는 컨테이너가 없으면 오류를 내므로 '|| true'를 붙여서 오류로 중단되지 않게 함
-            if [ "$(sudo docker inspect -f '{{.State.Running}}' cubeai-dev 2>/dev/null || echo 'false')" = 'true' ]; then
+            echo "🛑 기존 컨테이너 중지 및 삭제"
+            if [ "$(sudo docker inspect --format='{{.State.Running}}' cubeai-dev 2>/dev/null)" = "true" ]; then
               sudo docker stop cubeai-dev
-              sudo docker rm cubeai-dev
-            elif [ "$(sudo docker ps -aq -f name=cubeai-dev)" ]; then
-              # 중지된 상태의 컨테이너만 있을 경우
               sudo docker rm cubeai-dev
             fi
             
-            echo "📂 yml 파일을 저장할 호스트 디렉토리 생성"
-            sudo mkdir -p /home/ubuntu/cubeai-dev
-            sudo chown -R ubuntu:ubuntu /home/ubuntu/cubeai-dev
+            echo "📂 yml 파일을 저장할 디렉토리 생성"
+            sudo mkdir -p /home/ubuntu/cubeai-dev/src/main/resources
+            sudo chown -R ubuntu:ubuntu /home/ubuntu/cubeai-dev  # ubuntu 사용자가 접근 가능하도록 변경
+            sudo chmod -R 755 /home/ubuntu/cubeai-dev            # 디렉토리에 읽기, 쓰기, 실행 권한 부여
             
             echo "📄 yml 파일 생성 및 GitHub Secrets 값 적용"
-            echo "${{ secrets.DEVELOPMENT_APPLICATION }}" | sudo tee /home/ubuntu/cubeai-dev/application.yml > /dev/null
-            sudo chmod 644 /home/ubuntu/cubeai-dev/application.yml
+            echo "${{ secrets.DEVELOPMENT_APPLICATION }}" | sudo tee /home/ubuntu/cubeai-dev/src/main/resources/application.yml > /dev/null
+            sudo chmod 644 /home/ubuntu/cubeai-dev/src/main/resources/application.yml  # 모든 사용자 읽기 가능, 소유자만 쓰기 가능
             
-            echo "🚀 새 앱 컨테이너 실행 중..."
+            echo "🚀 새 컨테이너 실행 중..."
             sudo docker run -d --log-driver=syslog --name cubeai-dev \
               --network cubeai-network \
               --add-host host.docker.internal:host-gateway \
               -p 8080:8080 \
-              -v /home/ubuntu/cubeai-dev/application.yml:/application.yml \
+              -v /home/ubuntu/cubeai-dev/src/main/resources:/cubeai-dev/src/main/resources \
               --restart always \
-              ${{ secrets.DOKCER_USERNAME }}/cubeai-dev:${{ github.sha }}
+              ${{ secrets.DOCKER_USERNAME }}/cubeai-dev:${{ github.sha }}
             
             echo "✅ 실행 중인 컨테이너 확인"
             sudo docker ps -a | grep "cubeai-dev"
